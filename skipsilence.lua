@@ -1150,8 +1150,8 @@ local function prescan_stop()
     if not p.done then
         dprint("prescan: stopping")
         mp.abort_async_command(p.handle)
+        prescan_cleanup_files(p)
     end
-    prescan_cleanup_files(p)
     if prescan_driving and is_silent then
         -- detection filter events re-establish silence state
         local now = mp.get_time()
@@ -1235,7 +1235,7 @@ local function prescan_start()
         name = "subprocess",
         args = args,
         playback_only = false,
-        capture_stdout = true,
+        capture_stdout = false,
         capture_stderr = true,
     }, function(success, result, err)
         prescan_finished(p, success, result, err)
