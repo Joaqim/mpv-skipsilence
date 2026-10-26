@@ -325,6 +325,7 @@ local reapply_filter_timer = nil
 local prescan = nil
 local prescan_blocked = false
 local prescan_driving = false
+local prescan_provisional = false
 local prescan_count = 0
 
 local detect_filter_label = mp.get_script_name() .. "_silencedetect"
@@ -655,8 +656,9 @@ local function prescan_position(now)
 end
 
 -- Look up pre-scanned silence at `pos` (detection filter output pts).
--- Returns whether playback should be sped up, and the remaining stream time
--- until this changes (nil if unknown).
+-- Returns whether playback should be sped up, the remaining stream time
+-- until this changes (nil if unknown), and whether the result may change
+-- with further scan progress.
 local function prescan_state_at(pos)
     local p = prescan
     local spos = pos + p.start_offset
@@ -688,18 +690,18 @@ local function prescan_state_at(pos)
             if eff_end and eff_end < math.huge then
                 return true, eff_end - spos
             end
-            return true, nil
+            return true, nil, true
         end
         if not e then
             -- ongoing silence, not long enough yet
-            return false, p.covered - spos
+            return false, p.covered - spos, true
         end
     end
     if ilast < p.n then
         return false, p.ends[ilast] - opts.margin_end - spos
     end
     if p.covered < math.huge then
-        return false, p.covered - spos
+        return false, p.covered - spos, true
     end
     return false, nil
 end
@@ -723,7 +725,7 @@ local function check_time()
     prescan_driving = prescan_pos ~= nil
     if prescan_pos then
         local silent
-        silent, next_delay_pts = prescan_state_at(prescan_pos)
+        silent, next_delay_pts, prescan_provisional = prescan_state_at(prescan_pos)
         dprint("prescan pos:", prescan_pos, "silent:", silent, "remaining:", next_delay_pts)
         if silent ~= is_silent then
             is_silent = silent
@@ -1126,8 +1128,9 @@ local function prescan_poll()
     local p = prescan
     if not p or p.done or not prescan_read(p) then return end
     dprint("prescan: intervals:", p.n, "covered until:", p.covered - p.start_offset)
-    if is_enabled and not is_paused
-        and (prescan_driving or prescan_position(mp.get_time())) then
+    if not is_enabled or is_paused then return end
+    if prescan_driving and prescan_provisional
+        or not prescan_driving and prescan_position(mp.get_time()) then
         check_time()
     end
 end
@@ -1171,7 +1174,7 @@ local function prescan_finished(p, success, result, err)
             result and result.stderr)
     end
     prescan_cleanup_files(p)
-    if is_enabled and not is_paused and prescan_driving then
+    if is_enabled and not is_paused then
         check_time()
     end
 end
@@ -1219,7 +1222,7 @@ local function prescan_start()
     }
     local args = {"sh", "-c", prescan_script, "sh", opts.prescan_ytdl_path,
         opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter}
-    dprint("prescan: starting:", utils.to_string(args))
+    dprint("prescan: starting:", url, p.log_path)
     p.handle = mp.command_native_async({
         name = "subprocess",
         args = args,
