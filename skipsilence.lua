@@ -29,6 +29,9 @@
 --   pauses on network streams (cache_* options).
 -- - Experimental: Lookahead for dynamic slowdown and faster reaction time
 --   (`lookahead`, `slowdown_ramp_*`, `margin_*` options).
+-- - Experimental: Pre-scan of network streams with yt-dlp and ffmpeg, for
+--   exact slowdown at the end of silence without filter delay (`prescan*`
+--   options).
 -- - Workaround for scaletempo2 audio-video desynchronization in mpv 0.36 and
 --   below (resync_threshold_droppedframes option).
 -- - Workaround for clicks during speed changes with scaletempo2 in mpv 0.36
@@ -150,9 +153,9 @@ local opts = {
     -- Measured in seconds of stream time. Negative values are allowed, having
     -- the opposite effect.
     --
-    -- Requires lookahead to be active. Maximum backwards adjustment is limited
-    -- by the lookahead period (positive `margin_end` or negative
-    -- `margin_start`).
+    -- Requires lookahead or prescan to be active. Maximum backwards
+    -- adjustment is limited by the lookahead period (positive `margin_end` or
+    -- negative `margin_start`).
     margin_start = 0.05,
     margin_end = 0,
 
@@ -164,6 +167,21 @@ local opts = {
     -- starting point like startdelay (by up to the lookahead duration).
     -- Measured in seconds of stream time.
     minduration = 0,
+
+    -- EXPERIMENTAL: Pre-scan the audio of http(s) URLs in a background
+    -- process (yt-dlp piped into ffmpeg), which runs ahead of playback.
+    -- While the playback position is inside the scanned range, silence is
+    -- known in advance, and speed is controlled like with `lookahead`
+    -- (`margin_*`, `minduration` and `slowdown_ramp_*` options apply, even
+    -- if `lookahead` is 0). Elsewhere, the normal detection filter is used.
+    --
+    -- This downloads the audio stream a second time. It is not used if
+    -- noise reduction (arnndn_*) is active. Changing threshold_db or
+    -- threshold_duration stops the pre-scan for the current file.
+    prescan = false,
+    -- Paths of the executables used for pre-scan.
+    prescan_ytdl_path = "yt-dlp",
+    prescan_ffmpeg_path = "ffmpeg",
 
     -- How often to update the speed during silence, in seconds of real time.
     speed_updateinterval = 0.05,
@@ -294,6 +312,8 @@ local opts = {
     debug = false,
 }
 
+local utils = require "mp.utils"
+
 local is_enabled = false
 local base_speed = 1
 local is_silent = false
@@ -319,6 +339,15 @@ local events = {}
 
 local check_time_timer = nil
 local reapply_filter_timer = nil
+
+-- Pre-scan state of the current file, or nil. Silence intervals are stored
+-- in scan pts as `starts[i]`, `ends[i]` (nil while the silence is ongoing).
+-- `covered` is the scan pts up to which all silence is known.
+local prescan = nil
+local prescan_blocked = false
+local prescan_driving = false
+local prescan_provisional = false
+local prescan_count = 0
 
 local detect_filter_label = mp.get_script_name() .. "_silencedetect"
 local detect_filter_ffmpeg_id = mp.get_script_name() .. "_detection"
@@ -672,6 +701,73 @@ local function get_cache_speed_max()
     return speed_max
 end
 
+-- Get the detection filter output pts if it lies inside the pre-scanned
+-- range, otherwise nil.
+local function prescan_position(now)
+    if not prescan or not input_ref_pts then return nil end
+    local pos = get_input_pts(now) - filter_lookahead
+    -- Keep position monotonic until the next seek. Corrections of the
+    -- estimate by filter events can jump back, which would otherwise
+    -- re-enter a silence that just ended.
+    if prescan.min_pos and pos < prescan.min_pos then
+        pos = prescan.min_pos
+    end
+    prescan.min_pos = pos
+    if pos + prescan.start_offset >= prescan.covered then return nil end
+    return pos
+end
+
+-- Look up pre-scanned silence at `pos` (detection filter output pts).
+-- Returns whether playback should be sped up, the remaining stream time
+-- until this changes (nil if unknown), and whether the result may change
+-- with further scan progress.
+local function prescan_state_at(pos)
+    local p = prescan
+    local spos = pos + p.start_offset
+
+    -- first interval whose effective end is after spos
+    local lo, hi = 1, p.n + 1
+    while lo < hi do
+        local mid = math.floor((lo + hi) / 2)
+        local e = p.ends[mid]
+        if e and e - opts.margin_end <= spos then
+            lo = mid + 1
+        else
+            hi = mid
+        end
+    end
+
+    -- skip intervals too short for minduration and margins; bounded to
+    -- limit work per call
+    local ilast = math.min(p.n, lo + 31)
+    for i = lo, ilast do
+        local s, e = p.starts[i], p.ends[i]
+        local eff_start = s + opts.margin_start
+        local eff_end = e and e - opts.margin_end
+        if (e or p.covered) - s >= opts.minduration
+            and (not eff_end or eff_start < eff_end) then
+            if spos < eff_start then
+                return false, eff_start - spos
+            end
+            if eff_end and eff_end < math.huge then
+                return true, eff_end - spos
+            end
+            return true, nil, true
+        end
+        if not e then
+            -- ongoing silence, not long enough yet
+            return false, p.covered - spos, true
+        end
+    end
+    if ilast < p.n then
+        return false, p.ends[ilast] - opts.margin_end - spos
+    end
+    if p.covered < math.huge then
+        return false, p.covered - spos, true
+    end
+    return false, nil
+end
+
 local schedule_check_time -- function
 local function check_time()
     local now = mp.get_time()
@@ -685,8 +781,29 @@ local function check_time()
     local next_delay_pts = nil
 
     local index_current = events_ifirst
+    local events_iend = events_ilast
 
-    for index = events_ifirst, events_ilast do
+    local prescan_pos = prescan_position(now)
+    prescan_driving = prescan_pos ~= nil
+    if prescan_pos then
+        local silent
+        silent, next_delay_pts, prescan_provisional = prescan_state_at(prescan_pos)
+        dprint("prescan pos:", prescan_pos, "silent:", silent, "remaining:", next_delay_pts)
+        if silent ~= is_silent then
+            is_silent = silent
+            did_change = true
+        end
+        -- filter events are not used; keep the latest past event and
+        -- future events in case of fallback
+        while events_ifirst < events_ilast
+            and events[events_ifirst + 1].pts <= prescan_pos do
+            drop_event()
+        end
+        index_current = events_ifirst
+        events_iend = events_ifirst - 1
+    end
+
+    for index = events_ifirst, events_iend do
         local ev = events[index]
 
         if filter_lookahead > 0 then
@@ -845,7 +962,7 @@ local function handle_pause(name, paused)
         end
     end
 
-    if filter_lookahead > 0 and not paused and filter_restarted then
+    if (filter_lookahead > 0 or prescan) and not paused and filter_restarted then
         filter_restarted = false
         estimate_input_time(now)
     end
@@ -912,6 +1029,10 @@ local function add_event(silent, pts)
     if not prev or silent ~= prev.is_silent then
         local time = mp.get_time()
         if not filter_restart_time_pos or pts >= filter_restart_time_pos then
+            if prescan and input_ref_pts then
+                dprint("prescan: input pts estimate error:", get_input_pts(time)
+                    - pts - (silent and filter_threshold_duration or 0))
+            end
             if silent then
                 -- start message reports start of silence, so current pts is
                 -- after threshold duration
@@ -999,6 +1120,198 @@ local function handle_silence_msg(msg)
     end
 end
 
+-- Positional parameters: $1 yt-dlp, $2 ffmpeg, $3 url, $4 fifo path, $5 log
+-- path, $6 audio filter. The fifo lets ffmpeg replace the shell process,
+-- so aborting the subprocess kills ffmpeg, and yt-dlp exits on the broken
+-- pipe.
+local prescan_script = [[
+: > "$5" || exit 1
+mkfifo "$4" || exit 1
+"$1" -q --no-progress --no-playlist -f 'bestaudio/best' -o - -- "$3" 2>>"$5" >"$4" &
+exec <"$4"
+rm -f "$4"
+exec "$2" -hide_banner -nostdin -nostats -copyts -i pipe:0 -vn -sn -dn -af "$6" -f null - 2>>"$5"
+]]
+
+local prescan_poll_interval = 0.5
+
+local function prescan_parse_line(p, line)
+    local v = line:match("silence_start: ([^%s|]+)")
+    if v then
+        v = tonumber(v)
+        if v then
+            p.n = p.n + 1
+            p.starts[p.n] = v
+            p.ends[p.n] = nil
+            -- silence start is reported after threshold duration
+            p.reached = math.max(p.reached, v + p.threshold_duration)
+        end
+        return
+    end
+    v = line:match("silence_end: ([^%s|]+)")
+    if v then
+        v = tonumber(v)
+        if v and p.n > 0 and not p.ends[p.n] then
+            p.ends[p.n] = v
+            p.reached = math.max(p.reached, v)
+        end
+        return
+    end
+    v = tonumber(line:match(" pts_time:(%S+)"))
+    if v then
+        p.reached = math.max(p.reached, v)
+    elseif line ~= "" then
+        p.last_message = line
+    end
+end
+
+local function prescan_read(p)
+    local f = io.open(p.log_path, "rb")
+    if not f then return false end
+    f:seek("set", p.read_offset)
+    local data = f:read("*a")
+    f:close()
+    if not data or data == "" then return false end
+    p.read_offset = p.read_offset + #data
+    data = p.partial..data
+    local pos = 1
+    while true do
+        local nl = data:find("\n", pos, true)
+        if not nl then break end
+        prescan_parse_line(p, data:sub(pos, nl - 1))
+        pos = nl + 1
+    end
+    p.partial = data:sub(pos)
+    -- silence starting within threshold duration before the reached pts is
+    -- not reported yet
+    p.covered = math.max(p.covered, p.reached - p.threshold_duration)
+    return true
+end
+
+local function prescan_cleanup_files(p)
+    os.remove(p.log_path)
+    os.remove(p.fifo_path)
+end
+
+local function prescan_poll()
+    local p = prescan
+    if not p or p.done or not prescan_read(p) then return end
+    dprint("prescan: intervals:", p.n, "covered until:", p.covered - p.start_offset)
+    if not is_enabled or is_paused then return end
+    if prescan_driving and prescan_provisional
+        or not prescan_driving and prescan_position(mp.get_time()) then
+        check_time()
+    end
+end
+
+local function prescan_stop()
+    local p = prescan
+    if not p then return end
+    prescan = nil
+    p.timer:kill()
+    if not p.done then
+        dprint("prescan: stopping")
+        mp.abort_async_command(p.handle)
+        prescan_cleanup_files(p)
+    end
+    if prescan_driving and is_silent then
+        -- detection filter events re-establish silence state
+        local now = mp.get_time()
+        stats_end_current(now)
+        is_silent = false
+        expected_speed = base_speed
+        mp.set_property_number("speed", base_speed)
+        schedule_update_info(now)
+    end
+    prescan_driving = false
+end
+
+local function prescan_finished(p, success, result, err)
+    if prescan ~= p then return end
+    prescan_read(p)
+    p.timer:kill()
+    p.done = true
+    if success and result.status == 0 then
+        if p.n > 0 and not p.ends[p.n] then
+            p.ends[p.n] = math.huge
+        end
+        p.covered = math.huge
+        dprint("prescan: finished, intervals:", p.n)
+    else
+        mp.msg.warn("pre-scan failed; last message: "..tostring(p.last_message))
+        dprint("prescan: exit:", result and result.status, err,
+            result and result.stderr)
+    end
+    prescan_cleanup_files(p)
+    if is_enabled and not is_paused then
+        check_time()
+    end
+end
+
+local function prescan_start()
+    if prescan or prescan_blocked or not opts.prescan or not is_enabled then
+        return
+    end
+    local url = mp.get_property("path")
+    if not url then return end
+    if not url:find("^https?://") then
+        dprint("prescan: not an http(s) url:", url)
+        return
+    end
+    if opts.arnndn_enable and opts.arnndn_modelpath ~= "" then
+        dprint("prescan: not used with arnndn")
+        return
+    end
+
+    prescan_count = prescan_count + 1
+    local log_path
+    local runtime_dir = os.getenv("XDG_RUNTIME_DIR")
+    if runtime_dir and runtime_dir ~= "" then
+        log_path = runtime_dir.."/mpv-"..mp.get_script_name().."-"
+            ..utils.getpid().."-"..prescan_count..".log"
+    else
+        log_path = os.tmpname()
+    end
+    local filter = "silencedetect=noise="..opts.threshold_db.."dB:duration="
+        ..opts.threshold_duration
+        -- report progress about every 2 seconds of stream time
+        ..",aselect='isnan(prev_selected_t)+gte(t-prev_selected_t,2)',ashowinfo"
+    local p = {
+        log_path = log_path,
+        fifo_path = log_path..".fifo",
+        threshold_duration = opts.threshold_duration,
+        start_offset = mp.get_property_number("demuxer-start-time", 0),
+        read_offset = 0,
+        partial = "",
+        starts = {},
+        ends = {},
+        n = 0,
+        reached = -math.huge,
+        covered = -math.huge,
+        done = false,
+    }
+    local args = {"sh", "-c", prescan_script, "sh", opts.prescan_ytdl_path,
+        opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter}
+    dprint("prescan: starting:", url, p.log_path)
+    p.handle = mp.command_native_async({
+        name = "subprocess",
+        args = args,
+        playback_only = false,
+        capture_stdout = false,
+        capture_stderr = true,
+    }, function(success, result, err)
+        prescan_finished(p, success, result, err)
+    end)
+    p.timer = mp.add_periodic_timer(prescan_poll_interval, prescan_poll)
+    prescan = p
+end
+
+local function prescan_handle_file_loaded()
+    if prescan then
+        prescan.start_offset = mp.get_property_number("demuxer-start-time", 0)
+    end
+end
+
 local function set_option(opt_name, value)
     mp.commandv("change-list", "script-opts", "append",
         mp.get_script_name().."-"..opt_name.."="..value)
@@ -1057,6 +1370,9 @@ local function handle_start_file()
         total_saved_time = 0
     end
     update_info_now()
+    prescan_stop()
+    prescan_blocked = false
+    prescan_start()
 end
 
 -- events on seek:
@@ -1070,6 +1386,9 @@ end
 local function handle_seek()
     dprint("handle_seek")
     clear_silence_state()
+    if prescan then
+        prescan.min_pos = nil
+    end
     filter_restarted = true
     filter_restart_time_pos = nil
 end
@@ -1130,6 +1449,7 @@ local function enable(flag)
         end
         set_base_speed(mp.get_property_number("speed"))
 
+        prescan_start()
         check_time()
     end
 
@@ -1176,6 +1496,7 @@ local function disable(arg1, arg2)
             stats_end_current(mp.get_time())
         end
         is_silent = false
+        prescan_stop()
         is_enabled = false
         schedule_update_info()
         if not no_osd then
@@ -1220,6 +1541,19 @@ end
 (require "mp.options").read_options(opts, nil, function(list)
     if list["enabled"] and not opts.enabled and is_enabled then
         disable("no-osd")
+    end
+    if prescan and (list["threshold_db"] or list["threshold_duration"]
+        or opts.arnndn_enable and opts.arnndn_modelpath ~= "") then
+        dprint("prescan: detection options changed; stopped for this file")
+        prescan_stop()
+        prescan_blocked = true
+    end
+    if list["prescan"] then
+        if opts.prescan then
+            prescan_start()
+        else
+            prescan_stop()
+        end
     end
     if list["threshold_db"] or list["threshold_duration"] or list["lookahead"]
         or list["arnndn_enable"] or list["arnndn_modelpath"]
@@ -1267,6 +1601,9 @@ mp.add_key_binding(nil, "reset-total", reset_total_saved_time)
 mp.add_key_binding(nil, "toggle-arnndn", function() toggle_option("arnndn_enable") end)
 mp.add_key_binding(nil, "toggle-arnndn-output", function() toggle_option("arnndn_output") end)
 mp.register_event("start-file", handle_start_file)
+mp.register_event("file-loaded", prescan_handle_file_loaded)
+mp.register_event("end-file", function() prescan_stop() end)
+mp.register_event("shutdown", function() prescan_stop() end)
 
 set_base_speed(1)
 
