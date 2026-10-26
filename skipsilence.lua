@@ -1191,7 +1191,8 @@ local function prescan_start()
         return
     end
     local url = mp.get_property("path")
-    if not url or not (url:find("^https?://")) then
+    if not url then return end
+    if not url:find("^https?://") then
         dprint("prescan: not an http(s) url:", url)
         return
     end
