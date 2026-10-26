@@ -139,28 +139,40 @@ slowdown. `margin_end` can help, but is usually not required.
 
 ### Pre-scan network streams
 
-The experimental `prescan` option (disabled by default) analyses the audio of http(s) URLs in a background process while the file plays.
-It runs `yt-dlp` to download the best audio stream and pipes it into `ffmpeg` with the `silencedetect` filter, using the script's `threshold_db` and `threshold_duration`.
-The scan usually runs many times faster than real time, so the start and end of upcoming silence are known before playback reaches them.
+The experimental `prescan` option (disabled by default) analyses the audio of
+http(s) URLs in a background process while the file plays. It runs `yt-dlp` to
+download the best audio stream and pipes it into `ffmpeg` with the
+`silencedetect` filter, using the script's `threshold_db` and
+`threshold_duration`. The scan usually runs many times faster than real time,
+so the start and end of upcoming silence are known before playback reaches
+them.
 
-While the playback position is inside the scanned range, speed changes follow the scan results instead of the detection filter.
-The `margin_*`, `minduration` and `slowdown_ramp_*` options apply as with `lookahead`, even if `lookahead` is 0, and the slowdown ramp targets the exact end of silence.
-Outside the scanned range, for example before the scan has started or after seeking beyond it, the normal detection filter is used until the scan catches up.
+While the playback position is inside the scanned range, speed changes follow
+the scan results instead of the detection filter. The `margin_*`, `minduration`
+and `slowdown_ramp_*` options apply as with `lookahead`, even if `lookahead` is
+0, and the slowdown ramp targets the exact end of silence. Outside the scanned
+range, for example before the scan has started or after seeking beyond it, the
+normal detection filter is used until the scan catches up.
 
     script-opts-append=skipsilence-prescan=yes
 
-`yt-dlp` and `ffmpeg` must be in `PATH`, or configured with the `prescan_ytdl_path` and `prescan_ffmpeg_path` options.
-A POSIX `sh` with `mkfifo` is required.
+`yt-dlp` and `ffmpeg` must be in `PATH`, or configured with the
+`prescan_ytdl_path` and `prescan_ffmpeg_path` options. A POSIX `sh` with
+`mkfifo` is required.
 
 Current limitations:
 
 - The audio stream is downloaded a second time, from the start of the file.
-- Only the pipe from yt-dlp into ffmpeg is supported, and the scan always starts at the beginning of the file.
-  After seeking beyond the scanned range, the detection filter is used until the scan reaches the playback position.
-- Changing `threshold_db` or `threshold_duration` stops the pre-scan for the current file.
-- Pre-scan is not used when noise reduction (`arnndn_*` options) is active, because the scan does not apply it.
+- Only the pipe from yt-dlp into ffmpeg is supported, and the scan always
+  starts at the beginning of the file. After seeking beyond the scanned range,
+  the detection filter is used until the scan reaches the playback position.
+- Changing `threshold_db` or `threshold_duration` stops the pre-scan for the
+  current file.
+- Pre-scan is not used when noise reduction (`arnndn_*` options) is active,
+  because the scan does not apply it.
 - Twitch muted segments are treated as ordinary silence.
-- yt-dlp options configured for mpv's ytdl_hook (such as `ytdl-raw-options`) are not passed to the scan.
+- yt-dlp options configured for mpv's ytdl_hook (such as `ytdl-raw-options`)
+  are not passed to the scan.
 
 ### Profiles
 
