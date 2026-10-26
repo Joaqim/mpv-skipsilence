@@ -28,6 +28,8 @@ feature.
 - Saved time estimation.
 - Integration with osd-msg, auto profiles, etc. (with user-data, mpv 0.36 and
   above only).
+- Limit speedup by the amount of buffered data, to avoid buffering pauses on
+  network streams (`cache_*` options).
 - Experimental: Lookahead for dynamic slowdown and faster reaction time
   (`lookahead`, `slowdown_ramp_*`, `margin_*` options).
 - Workaround for scaletempo2 audio-video desynchronization in mpv 0.36 and
@@ -134,6 +136,38 @@ gradually slowing down before the end of silence is reached. See the
 `lookahead`, `slowdown_ramp_*` and `margin_*` options. To maximize skipping
 speed, use a slowdown ramp that is as steep as possible without overshooting on
 slowdown. `margin_end` can help, but is usually not required.
+
+### Streaming with yt-dlp
+
+When playing network streams (for example YouTube, Twitch VODs, or Vimeo via
+yt-dlp), high speed during silence can consume buffered data faster than it is
+downloaded, which makes mpv pause for buffering. To prevent this, the speed
+during silence is limited depending on the buffered duration reported by the
+`demuxer-cache-duration` property. At or below `cache_low` seconds (default 2)
+of buffered data, the speed during silence is limited to the normal playback
+speed. At or above `cache_high` seconds (default 10), `speed_max` applies, and
+in between the limit increases linearly. No limit is applied once the end of
+the file has been buffered, or if the buffered duration is unavailable.
+
+The `cache_limit` option selects when this applies. The default `network` only
+applies it if mpv considers the stream to be played via network (the
+`demuxer-via-network` property), `always` applies it to all files, and `off`
+disables it.
+
+The limit works best if mpv is allowed to buffer well ahead of the playback
+position. For network streams, the amount buffered ahead is mostly limited by
+`demuxer-max-bytes`, and choosing a lower resolution makes the same amount of
+memory cover a longer duration. A profile for on-demand streams could look like
+this:
+
+    [skipsilence-stream]
+    demuxer-max-bytes=500MiB
+    ytdl-format=bestvideo[height<=?720]+bestaudio/best
+    script-opts-append=skipsilence-cache_low=2
+    script-opts-append=skipsilence-cache_high=10
+
+Note that Twitch VODs mute segments containing copyrighted music, and
+skipsilence treats these segments as silence.
 
 ### Profiles
 

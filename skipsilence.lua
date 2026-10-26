@@ -25,6 +25,8 @@
 -- - Saved time estimation.
 -- - Integration with osd-msg, auto profiles, etc. (with user-data, mpv 0.36
 --   and above only).
+-- - Limit speedup by the amount of buffered data, to avoid buffering
+--   pauses on network streams (cache_* options).
 -- - Experimental: Lookahead for dynamic slowdown and faster reaction time
 --   (`lookahead`, `slowdown_ramp_*`, `margin_*` options).
 -- - Workaround for scaletempo2 audio-video desynchronization in mpv 0.36 and
@@ -167,6 +169,25 @@ local opts = {
     speed_updateinterval = 0.05,
     -- The maximum playback speed during silence.
     speed_max = 4,
+
+    -- Limit the speed during silence depending on how much of the stream is
+    -- buffered ahead (the demuxer-cache-duration property). This prevents
+    -- draining the cache and pausing for buffering on network streams.
+    --
+    -- May be one of
+    -- - 'network' (only when the demuxer-via-network property is true),
+    -- - 'always',
+    -- - 'off'.
+    --
+    -- No limit is applied if the buffered duration is unavailable, or if
+    -- the end of the file has been buffered.
+    cache_limit = "network",
+    -- Buffered duration in seconds at or below which speed during silence is
+    -- limited to the normal playback speed. Between cache_low and cache_high,
+    -- the maximum speed increases linearly from the normal playback speed to
+    -- speed_max. At or above cache_high, speed_max applies.
+    cache_low = 2,
+    cache_high = 10,
 
     -- Speedup ramp parameters. The formula for playback speedup is:
     --
@@ -617,6 +638,40 @@ local function clear_silence_state()
     end
 end
 
+local function is_cache_limit_active()
+    if opts.cache_limit == "always" then
+        return true
+    elseif opts.cache_limit == "network" then
+        return mp.get_property_bool("demuxer-via-network", false)
+    end
+    return false
+end
+
+-- Maximum speed during silence for the currently buffered duration.
+local function get_cache_speed_max()
+    if opts.speed_max <= base_speed then
+        return opts.speed_max
+    end
+    local cache = mp.get_property_number("demuxer-cache-duration")
+    if not cache then
+        return opts.speed_max
+    end
+    local state = mp.get_property_native("demuxer-cache-state")
+    if state and state.eof then
+        return opts.speed_max
+    end
+    local fraction
+    if opts.cache_high <= opts.cache_low then
+        fraction = cache > opts.cache_low and 1 or 0
+    else
+        fraction = (cache - opts.cache_low) / (opts.cache_high - opts.cache_low)
+        fraction = math.max(0, math.min(1, fraction))
+    end
+    local speed_max = base_speed + (opts.speed_max - base_speed) * fraction
+    dprint("cache duration:", cache, "speed max:", speed_max)
+    return speed_max
+end
+
 local schedule_check_time -- function
 local function check_time()
     local now = mp.get_time()
@@ -727,16 +782,23 @@ local function check_time()
             dprint("last speed change too recent; recheck in", remaining)
             next_delay = take_lower(next_delay, remaining)
         else
+            local cache_limited = is_cache_limit_active()
+            local speed_max = opts.speed_max
+            if cache_limited then
+                speed_max = get_cache_speed_max()
+            end
             local s = base_speed * (opts.ramp_constant
                 + (stats_silence_length(now) * opts.ramp_factor) ^ opts.ramp_exponent)
             if next_delay_pts then
                 s = math.min(s, base_speed * (opts.slowdown_ramp_constant
                     + (next_delay_pts * opts.slowdown_ramp_factor) ^ opts.slowdown_ramp_exponent))
             end
-            if next_delay_pts or s <= opts.speed_max or new_speed ~= opts.speed_max then
-                new_speed = math.min(s, opts.speed_max)
+            if cache_limited or next_delay_pts or s <= speed_max or new_speed ~= speed_max then
+                new_speed = math.min(s, speed_max)
                 last_speed_change_time = now
-                if next_delay_pts or new_speed ~= opts.speed_max then
+                -- keep checking while cache limited to follow the buffered
+                -- duration
+                if cache_limited or next_delay_pts or new_speed ~= speed_max then
                     next_delay = take_lower(next_delay, opts.speed_updateinterval)
                 end
             end
@@ -1172,7 +1234,8 @@ end
         or list["slowdown_ramp_constant"] or list["slowdown_ramp_factor"]
         or list["slowdown_ramp_exponent"] or list["minduration"]
         or list["startdelay"] or list["margin_start"] or list["margin_end"]
-        or list["speed_updateinterval"] or list["speed_max"] then
+        or list["speed_updateinterval"] or list["speed_max"]
+        or list["cache_limit"] or list["cache_low"] or list["cache_high"] then
         if is_enabled then
             check_time()
         end
