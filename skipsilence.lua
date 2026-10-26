@@ -651,6 +651,13 @@ end
 local function prescan_position(now)
     if not prescan or not input_ref_pts then return nil end
     local pos = get_input_pts(now) - filter_lookahead
+    -- Keep position monotonic until the next seek. Corrections of the
+    -- estimate by filter events can jump back, which would otherwise
+    -- re-enter a silence that just ended.
+    if prescan.min_pos and pos < prescan.min_pos then
+        pos = prescan.min_pos
+    end
+    prescan.min_pos = pos
     if pos + prescan.start_offset >= prescan.covered then return nil end
     return pos
 end
@@ -1316,6 +1323,9 @@ end
 local function handle_seek()
     dprint("handle_seek")
     clear_silence_state()
+    if prescan then
+        prescan.min_pos = nil
+    end
     filter_restarted = true
     filter_restart_time_pos = nil
 end
