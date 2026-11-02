@@ -200,6 +200,9 @@ Current limitations:
 - Only the pipe from yt-dlp into ffmpeg is supported, and the scan always
   starts at the beginning of the file. After seeking beyond the scanned range,
   the detection filter is used until the scan reaches the playback position.
+- If the scan ends prematurely, for example when the download is interrupted
+  mid-stream, the scanned range is kept, a warning is shown, and the
+  detection filter is used beyond the scanned range.
 - Changing `threshold_db` or `threshold_duration` stops the pre-scan for the
   current file.
 - Pre-scan is not used when noise reduction (`arnndn_*` options) is active,

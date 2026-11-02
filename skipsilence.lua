@@ -1121,13 +1121,19 @@ local function handle_silence_msg(msg)
 end
 
 -- Positional parameters: $1 yt-dlp, $2 ffmpeg, $3 url, $4 fifo path, $5 log
--- path, $6 audio filter. The fifo lets ffmpeg replace the shell process,
--- so aborting the subprocess kills ffmpeg, and yt-dlp exits on the broken
--- pipe.
+-- path, $6 audio filter, $7 yt-dlp status file. The fifo lets ffmpeg replace
+-- the shell process, so aborting the subprocess kills ffmpeg, and yt-dlp
+-- exits on the broken pipe. yt-dlp runs inside a brace group that owns the
+-- fifo write end until its exit status has been written to the status file,
+-- so the status is final before ffmpeg can see EOF on the pipe. The status
+-- file is opened once as fd 3 and written through that fd: the group
+-- survives a killed ffmpeg and must not recreate the file by name after
+-- an aborted scan has unlinked it.
 local prescan_script = [[
 : > "$5" || exit 1
+exec 3>"$7" || exit 1
 mkfifo "$4" || exit 1
-"$1" -q --no-progress --no-playlist -f 'bestaudio/best' -o - -- "$3" 2>>"$5" >"$4" &
+{ "$1" -q --no-progress --no-playlist -f 'bestaudio/best' -o - -- "$3"; echo $? >&3; } >"$4" 2>>"$5" &
 exec <"$4"
 rm -f "$4"
 exec "$2" -hide_banner -nostdin -nostats -copyts -i pipe:0 -vn -sn -dn -af "$6" -f null - 2>>"$5"
@@ -1191,6 +1197,7 @@ end
 local function prescan_cleanup_files(p)
     os.remove(p.log_path)
     os.remove(p.fifo_path)
+    os.remove(p.status_path)
 end
 
 local function prescan_poll()
@@ -1226,26 +1233,47 @@ local function prescan_stop()
     prescan_driving = false
 end
 
+local function prescan_read_ytdl_status(p)
+    local f = io.open(p.status_path, "rb")
+    if not f then return nil end
+    local data = f:read("*a")
+    f:close()
+    if not data then return nil end
+    return tonumber(data:match("^%s*(%-?%d+)%s*$"))
+end
+
 local function prescan_finished(p, success, result, err)
     if prescan ~= p then return end
     prescan_read(p)
     p.timer:kill()
     p.done = true
-    if success and result.status == 0 then
+    local ytdl_status = prescan_read_ytdl_status(p)
+    if success and result.status == 0 and ytdl_status == 0 then
         if p.n > 0 and not p.ends[p.n] then
             p.ends[p.n] = math.huge
         end
         p.covered = math.huge
         dprint("prescan: finished, intervals:", p.n)
     else
-        mp.msg.warn("pre-scan failed; last message: "..tostring(p.last_message))
-        dprint("prescan: exit:", result and result.status, err,
-            result and result.stderr)
+        -- incomplete: keep the parsed watermark, close a dangling interval
+        -- at it so check_time gets a concrete recheck delay (the poll timer
+        -- is dead and provisional results would never be rechecked)
+        if p.n > 0 and not p.ends[p.n] then
+            p.ends[p.n] = p.covered
+        end
+        local covered_s = p.covered > -math.huge and p.covered - p.start_offset
+        mp.msg.warn(("pre-scan incomplete (yt-dlp exit %s, ffmpeg exit %s)"
+            ..(covered_s and "; covered %.1fs" or "; no data scanned"))
+            :format(tostring(ytdl_status),
+                tostring(success and result and result.status or "?"),
+                covered_s or 0))
+        if p.last_message and p.last_message ~= "" then
+            mp.msg.warn("pre-scan last message: "..p.last_message)
+        end
+        mp.osd_message("skip-silence: pre-scan incomplete, using detection filter", 4)
     end
     prescan_cleanup_files(p)
-    if is_enabled and not is_paused then
-        check_time()
-    end
+    if is_enabled and not is_paused then check_time() end
 end
 
 local function prescan_start()
@@ -1279,6 +1307,7 @@ local function prescan_start()
     local p = {
         log_path = log_path,
         fifo_path = log_path..".fifo",
+        status_path = log_path..".status",
         threshold_duration = opts.threshold_duration,
         start_offset = mp.get_property_number("demuxer-start-time", 0),
         read_offset = 0,
@@ -1291,7 +1320,8 @@ local function prescan_start()
         done = false,
     }
     local args = {"sh", "-c", prescan_script, "sh", opts.prescan_ytdl_path,
-        opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter}
+        opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter,
+        p.status_path}
     dprint("prescan: starting:", url, p.log_path)
     p.handle = mp.command_native_async({
         name = "subprocess",
