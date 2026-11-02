@@ -182,6 +182,21 @@ local opts = {
     -- Paths of the executables used for pre-scan.
     prescan_ytdl_path = "yt-dlp",
     prescan_ffmpeg_path = "ffmpeg",
+    -- Format selector passed to yt-dlp as -f for the pre-scan. Empty passes
+    -- no -f (the yt-dlp default). mpv's ytdl-format is deliberately not
+    -- inherited: it usually selects video-bearing formats, and the scan only
+    -- needs audio.
+    prescan_ytdl_format = "bestaudio/best",
+    -- Whether the pre-scan inherits mpv's ytdl-raw-options. Cookie and
+    -- identity options configured for mpv playback must reach the scan too,
+    -- or the second download session can be rejected by the site, for
+    -- example with HTTP 429.
+    prescan_inherit_ytdl_options = true,
+    -- Extra yt-dlp arguments for the pre-scan, split on whitespace and
+    -- appended after the inherited options. Values containing spaces are not
+    -- representable this way; use a wrapper script via prescan_ytdl_path for
+    -- those.
+    prescan_ytdl_extra_args = "",
 
     -- How often to update the speed during silence, in seconds of real time.
     speed_updateinterval = 0.05,
@@ -1121,22 +1136,35 @@ local function handle_silence_msg(msg)
 end
 
 -- Positional parameters: $1 yt-dlp, $2 ffmpeg, $3 url, $4 fifo path, $5 log
--- path, $6 audio filter, $7 yt-dlp status file. The fifo lets ffmpeg replace
--- the shell process, so aborting the subprocess kills ffmpeg, and yt-dlp
--- exits on the broken pipe. yt-dlp runs inside a brace group that owns the
--- fifo write end until its exit status has been written to the status file,
--- so the status is final before ffmpeg can see EOF on the pipe. The status
--- file is opened once as fd 3 and written through that fd: the group
--- survives a killed ffmpeg and must not recreate the file by name after
--- an aborted scan has unlinked it.
+-- path, $6 audio filter, $7 yt-dlp status file; everything after is passed
+-- to yt-dlp as "$@". The seven parameters are shifted off into names so the
+-- extras arrive as separate argv elements without word-splitting, keeping
+-- paths with spaces intact. The scan-critical options (-q --no-progress
+-- --no-playlist -o - and the trailing -- URL) sit after "$@": yt-dlp resolves
+-- repeated scalar options last-wins, so they take precedence over
+-- conflicting extras. The fifo lets ffmpeg replace the shell process, so
+-- aborting the subprocess kills ffmpeg, and yt-dlp exits on the broken pipe.
+-- yt-dlp runs inside a brace group that owns the fifo write end until its
+-- exit status has been written to the status file, so the status is final
+-- before ffmpeg can see EOF on the pipe. The status file is opened once as
+-- fd 3 and written through that fd: the group survives a killed ffmpeg and
+-- must not recreate the file by name after an aborted scan has unlinked it.
 local prescan_script = [[
-: > "$5" || exit 1
-exec 3>"$7" || exit 1
-mkfifo "$4" || exit 1
-{ "$1" -q --no-progress --no-playlist -f 'bestaudio/best' -o - -- "$3"; echo $? >&3; } >"$4" 2>>"$5" &
-exec <"$4"
-rm -f "$4"
-exec "$2" -hide_banner -nostdin -nostats -copyts -i pipe:0 -vn -sn -dn -af "$6" -f null - 2>>"$5"
+ytdl=$1
+ffmpeg=$2
+url=$3
+fifo=$4
+log=$5
+filter=$6
+status=$7
+shift 7
+: >"$log" || exit 1
+exec 3>"$status" || exit 1
+mkfifo "$fifo" || exit 1
+{ "$ytdl" "$@" -q --no-progress --no-playlist -o - -- "$url"; echo $? >&3; } >"$fifo" 2>>"$log" &
+exec <"$fifo"
+rm -f "$fifo"
+exec "$ffmpeg" -hide_banner -nostdin -nostats -copyts -i pipe:0 -vn -sn -dn -af "$filter" -f null - 2>>"$log"
 ]]
 
 local prescan_poll_interval = 0.5
@@ -1276,6 +1304,24 @@ local function prescan_finished(p, success, result, err)
     if is_enabled and not is_paused then check_time() end
 end
 
+local function prescan_ytdl_inherited_args()
+    if not opts.prescan_inherit_ytdl_options then return {} end
+    local raw = mp.get_property_native("options/ytdl-raw-options") or {}
+    local args = {}
+    for key, value in pairs(raw) do
+        local function add(v)
+            args[#args+1] = "--"..key
+            if v ~= "" or key == "proxy" then args[#args+1] = v end
+        end
+        if type(value) == "table" then
+            for _, entry in ipairs(value) do add(entry) end
+        else
+            add(value)
+        end
+    end
+    return args
+end
+
 local function prescan_start()
     if prescan or prescan_blocked or not opts.prescan or not is_enabled then
         return
@@ -1319,9 +1365,21 @@ local function prescan_start()
         covered = -math.huge,
         done = false,
     }
+    local ytdl_args = prescan_ytdl_inherited_args()
+    for token in opts.prescan_ytdl_extra_args:gmatch("%S+") do
+        ytdl_args[#ytdl_args+1] = token
+    end
+    if opts.prescan_ytdl_format ~= "" then
+        ytdl_args[#ytdl_args+1] = "-f"
+        ytdl_args[#ytdl_args+1] = opts.prescan_ytdl_format
+    end
     local args = {"sh", "-c", prescan_script, "sh", opts.prescan_ytdl_path,
         opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter,
         p.status_path}
+    for _, arg in ipairs(ytdl_args) do
+        args[#args+1] = arg
+    end
+    dprint("prescan: ytdl args:", table.concat(ytdl_args, " "))
     dprint("prescan: starting:", url, p.log_path)
     p.handle = mp.command_native_async({
         name = "subprocess",

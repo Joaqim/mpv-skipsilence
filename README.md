@@ -194,6 +194,38 @@ normal detection filter is used until the scan catches up.
 `prescan_ytdl_path` and `prescan_ffmpeg_path` options. A POSIX `sh` with
 `mkfifo` is required.
 
+By default the scan inherits the yt-dlp options configured for mpv playback
+(`ytdl-raw-options`), so cookies and other identity options set for playback
+reach the scan too. Without them, the second download session can be rejected
+by the site, for example with HTTP 429:
+
+    ytdl-raw-options=cookies=~/.config/mpv/cookies.txt,user-agent=Mozilla/5.0
+
+Inherited options cannot override the scan's critical settings: conflicting
+scalar options, such as format, output or playlist handling, lose to the
+scan's own trailing flags, which win by yt-dlp's last-wins resolution of
+repeated scalar options. Options that suppress the download or change what
+yt-dlp writes to stdout, for example `simulate` or `dump-json`, are
+incompatible with the scan, and playback through ytdl_hook may keep working
+with some of them, so a working mpv configuration is not a guarantee here.
+When such an option starves the scan, the scan ends incomplete: a warning
+is shown and the detection filter is used beyond the scanned range, so
+playback degrades to the normal behavior instead of breaking.
+
+The audio format for the scan is selected with `prescan_ytdl_format` (default
+`bestaudio/best`; empty uses the yt-dlp default). mpv's `ytdl-format` is not
+inherited because it usually selects video-bearing formats, and the scan only
+needs audio.
+
+Further yt-dlp arguments can be passed with `prescan_ytdl_extra_args`, which
+is split on whitespace and appended after the inherited options. Because mpv
+splits `--script-opts` values on commas, arguments containing a comma must be
+set in `mpv.conf` with `script-opts-append` instead, and values containing
+spaces are not representable at all; a wrapper script via `prescan_ytdl_path`
+covers those cases:
+
+    script-opts-append=skipsilence-prescan_ytdl_extra_args=--force-ipv4
+
 Current limitations:
 
 - The audio stream is downloaded a second time, from the start of the file.
@@ -203,13 +235,15 @@ Current limitations:
 - If the scan ends prematurely, for example when the download is interrupted
   mid-stream, the scanned range is kept, a warning is shown, and the
   detection filter is used beyond the scanned range.
+- yt-dlp `exec`/`print` options with `after_move`/`after_video` timing never
+  fire during mpv's simulate-mode playback resolution but do fire during the
+  scan's real download, appending their output to the scanned audio; the
+  scan then ends incomplete and the detection filter is used.
 - Changing `threshold_db` or `threshold_duration` stops the pre-scan for the
   current file.
 - Pre-scan is not used when noise reduction (`arnndn_*` options) is active,
   because the scan does not apply it.
 - Twitch muted segments are treated as ordinary silence.
-- yt-dlp options configured for mpv's ytdl_hook (such as `ytdl-raw-options`)
-  are not passed to the scan.
 
 ### Profiles
 

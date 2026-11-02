@@ -6,14 +6,16 @@
 # the tested copy. Fake yt-dlp and ffmpeg executables are placed on a
 # temporary PATH and the extracted script is run through sh -c with the same
 # argument shape prescan_start uses: sh -c <script> sh <yt-dlp> <ffmpeg>
-# <url> <fifo> <log> <filter> <status>. The cases verify the ordering
-# contract between the yt-dlp status file and the fifo EOF observed by
-# ffmpeg: the brace group holds the fifo write end until the status is
-# final, so when ffmpeg sees EOF the status file already holds yt-dlp's
-# exit code.
+# <url> <fifo> <log> <filter> <status> [yt-dlp options...]. The cases
+# verify the ordering contract between the yt-dlp status file and the fifo
+# EOF observed by ffmpeg: the brace group holds the fifo write end until
+# the status is final, so when ffmpeg sees EOF the status file already
+# holds yt-dlp's exit code.
 #
-# Argument-integrity and flag-precedence cases arrive with a later change to
-# the embedded script.
+# The later cases pass yt-dlp options after the status path and verify
+# argument integrity (options forwarded as separate argv elements, no
+# word-splitting) and flag precedence (the script's own trailing options win
+# by yt-dlp's last-wins resolution of repeated scalar flags).
 
 set -u
 
@@ -33,9 +35,16 @@ cat > "$tmp/bin/yt-dlp" <<'EOF'
 # ok writes a payload and exits 0. partial writes a payload, goes quiet for
 # a while (the fifo stays open but empty), then exits 7 like a fetch
 # rejected mid-stream. midwrite is mid-download when ffmpeg dies: a chunk,
-# a pause, then another chunk that hits the closed pipe.
+# a pause, then another chunk that hits the closed pipe. record writes its
+# full argv, one token per line, to $FAKE_YTDL_ARGV and then behaves like
+# ok.
 case ${FAKE_YTDL_MODE:-} in
 ok)
+    printf 'fake audio payload\n'
+    exit 0
+    ;;
+record)
+    printf '%s\n' "$@" > "${FAKE_YTDL_ARGV:?}"
     printf 'fake audio payload\n'
     exit 0
     ;;
@@ -234,6 +243,84 @@ case $held_status in
     printf 'PASS abort: status <%s> written to the held fd\n' "$held_status"
     ;;
 esac
+[ "$failures" = "$before" ] || show_log "$log"
+
+# Case 5: argument integrity. prescan_start appends yt-dlp options after the
+# status path, and the script must forward them to yt-dlp as separate argv
+# elements without word-splitting. A cookie path containing a space must
+# arrive as one token, and a flag/value pair must survive intact.
+
+case_dir=$tmp/case5
+mkdir "$case_dir" || exit 1
+fifo=$case_dir/stream.fifo
+log=$case_dir/ffmpeg.log
+status=$case_dir/ytdl.status
+observed=$case_dir/observed-at-eof
+argv=$case_dir/ytdl-argv
+cookies="$case_dir/co okies.txt"
+before=$failures
+
+PATH="$tmp/bin:$PATH" FAKE_YTDL_MODE=record FAKE_FFMPEG_MODE=consume \
+    FAKE_STATUS_FILE="$status" FAKE_OBSERVED="$observed" \
+    FAKE_YTDL_ARGV="$argv" \
+    sh -c "$(cat "$tmp/script.sh")" sh yt-dlp ffmpeg \
+    'https://example.invalid/audio' "$fifo" "$log" \
+    'silencedetect=noise=-30dB:duration=0.05' "$status" \
+    --cookies-from-browser firefox --cookies "$cookies"
+code=$?
+
+check 'integrity: overall exit status' 0 "$code"
+check 'integrity: yt-dlp status when ffmpeg sees EOF' 0 \
+    "$(cat "$observed" 2>/dev/null)"
+check 'integrity: spaced cookie path stays one argv element' 1 \
+    "$(grep -cx -e "$cookies" "$argv" 2>/dev/null)"
+check 'integrity: --cookies-from-browser value follows the flag' firefox \
+    "$(awk '$0 == "--cookies-from-browser" { getline; print; exit }' \
+        "$argv" 2>/dev/null)"
+[ "$failures" = "$before" ] || show_log "$log"
+
+# Case 6: flag precedence. prescan_start appends inherited and user options
+# first and its own -f last, and the script adds its critical options after
+# all of them. yt-dlp resolves repeated scalar options last-wins, so the
+# recorded argv must carry both -f occurrences with bestaudio/best last, and
+# end with the script's own -o -, -- and URL (its -o wins the same way).
+
+case_dir=$tmp/case6
+mkdir "$case_dir" || exit 1
+fifo=$case_dir/stream.fifo
+log=$case_dir/ffmpeg.log
+status=$case_dir/ytdl.status
+observed=$case_dir/observed-at-eof
+argv=$case_dir/ytdl-argv
+url='https://example.invalid/audio'
+before=$failures
+
+PATH="$tmp/bin:$PATH" FAKE_YTDL_MODE=record FAKE_FFMPEG_MODE=consume \
+    FAKE_STATUS_FILE="$status" FAKE_OBSERVED="$observed" \
+    FAKE_YTDL_ARGV="$argv" \
+    sh -c "$(cat "$tmp/script.sh")" sh yt-dlp ffmpeg \
+    "$url" "$fifo" "$log" \
+    'silencedetect=noise=-30dB:duration=0.05' "$status" \
+    -f custom -o /tmp/x -f bestaudio/best
+code=$?
+
+check 'precedence: overall exit status' 0 "$code"
+check 'precedence: yt-dlp status when ffmpeg sees EOF' 0 \
+    "$(cat "$observed" 2>/dev/null)"
+check 'precedence: both -f flags present' 2 \
+    "$(grep -cx -e '-f' "$argv" 2>/dev/null)"
+last_f=$(awk 'prev == "-f" { value = $0 } { prev = $0 } \
+    END { print value }' "$argv" 2>/dev/null)
+check 'precedence: last -f value' bestaudio/best "$last_f"
+last_o=$(awk 'prev == "-o" { value = $0 } { prev = $0 } \
+    END { print value }' "$argv" 2>/dev/null)
+check 'precedence: last -o value' - "$last_o"
+expected_tail="-o
+-
+--
+$url"
+check 'precedence: argv ends with -o - -- URL' "$expected_tail" \
+    "$(tail -n 4 "$argv" 2>/dev/null)"
 [ "$failures" = "$before" ] || show_log "$log"
 
 if command -v shellcheck > /dev/null 2>&1; then
