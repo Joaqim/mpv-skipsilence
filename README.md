@@ -226,9 +226,19 @@ covers those cases:
 
     script-opts-append=skipsilence-prescan_ytdl_extra_args=--force-ipv4
 
+The scan's download can be rate-limited with `prescan_limit_rate`, which is
+passed to yt-dlp as `--limit-rate`; empty (the default) means no limit. The
+scan normally outruns real-time playback by a wide margin, so a moderate
+limit costs little scan speed. Recommended values are between 500K and 2M;
+the limit keeps the second download from competing with mpv's own demuxer
+download of the same stream:
+
+    script-opts-append=skipsilence-prescan_limit_rate=1M
+
 Current limitations:
 
-- The audio stream is downloaded a second time, from the start of the file.
+- The audio stream is downloaded a second time, from the start of the file;
+  `prescan_limit_rate` bounds the rate of that second download.
 - Only the pipe from yt-dlp into ffmpeg is supported, and the scan always
   starts at the beginning of the file. After seeking beyond the scanned range,
   the detection filter is used until the scan reaches the playback position.

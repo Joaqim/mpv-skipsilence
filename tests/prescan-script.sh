@@ -280,10 +280,12 @@ check 'integrity: --cookies-from-browser value follows the flag' firefox \
 [ "$failures" = "$before" ] || show_log "$log"
 
 # Case 6: flag precedence. prescan_start appends inherited and user options
-# first and its own -f last, and the script adds its critical options after
-# all of them. yt-dlp resolves repeated scalar options last-wins, so the
-# recorded argv must carry both -f occurrences with bestaudio/best last, and
-# end with the script's own -o -, -- and URL (its -o wins the same way).
+# first and its own -f and --limit-rate last, and the script adds its
+# critical options after all of them. yt-dlp resolves repeated scalar options
+# last-wins, so the recorded argv must carry both -f occurrences with
+# bestaudio/best last and both --limit-rate occurrences with the appended
+# rate last, and end with the script's own -o -, -- and URL (its -o wins the
+# same way).
 
 case_dir=$tmp/case6
 mkdir "$case_dir" || exit 1
@@ -301,7 +303,7 @@ PATH="$tmp/bin:$PATH" FAKE_YTDL_MODE=record FAKE_FFMPEG_MODE=consume \
     sh -c "$(cat "$tmp/script.sh")" sh yt-dlp ffmpeg \
     "$url" "$fifo" "$log" \
     'silencedetect=noise=-30dB:duration=0.05' "$status" \
-    -f custom -o /tmp/x -f bestaudio/best
+    -f custom --limit-rate 10M -o /tmp/x -f bestaudio/best --limit-rate 1M
 code=$?
 
 check 'precedence: overall exit status' 0 "$code"
@@ -312,6 +314,11 @@ check 'precedence: both -f flags present' 2 \
 last_f=$(awk 'prev == "-f" { value = $0 } { prev = $0 } \
     END { print value }' "$argv" 2>/dev/null)
 check 'precedence: last -f value' bestaudio/best "$last_f"
+check 'precedence: both --limit-rate flags present' 2 \
+    "$(grep -cx -e '--limit-rate' "$argv" 2>/dev/null)"
+last_rate=$(awk 'prev == "--limit-rate" { value = $0 } { prev = $0 } \
+    END { print value }' "$argv" 2>/dev/null)
+check 'precedence: last --limit-rate value' 1M "$last_rate"
 last_o=$(awk 'prev == "-o" { value = $0 } { prev = $0 } \
     END { print value }' "$argv" 2>/dev/null)
 check 'precedence: last -o value' - "$last_o"

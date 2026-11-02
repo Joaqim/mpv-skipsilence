@@ -197,6 +197,11 @@ local opts = {
     -- representable this way; use a wrapper script via prescan_ytdl_path for
     -- those.
     prescan_ytdl_extra_args = "",
+    -- Maximum download rate for the pre-scan's yt-dlp, passed as
+    -- --limit-rate. Empty (the default) means no limit. This bounds the
+    -- second download so the scan does not compete with mpv's own fetch of
+    -- the same stream.
+    prescan_limit_rate = "",
 
     -- How often to update the speed during silence, in seconds of real time.
     speed_updateinterval = 0.05,
@@ -1372,6 +1377,10 @@ local function prescan_start()
     if opts.prescan_ytdl_format ~= "" then
         ytdl_args[#ytdl_args+1] = "-f"
         ytdl_args[#ytdl_args+1] = opts.prescan_ytdl_format
+    end
+    if opts.prescan_limit_rate ~= "" then
+        ytdl_args[#ytdl_args+1] = "--limit-rate"
+        ytdl_args[#ytdl_args+1] = opts.prescan_limit_rate
     end
     local args = {"sh", "-c", prescan_script, "sh", opts.prescan_ytdl_path,
         opts.prescan_ffmpeg_path, url, p.fifo_path, p.log_path, filter,
